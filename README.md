@@ -39,8 +39,38 @@ Sensor ids are anonymised in the source data.
 
 ```
 python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-python secom.py
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe secom.py
 ```
 
+VS Code uses `.venv\Scripts\python.exe` as the project interpreter. You can also activate it in a PowerShell terminal with `.\.venv\Scripts\Activate.ps1`, then run `python secom.py`.
+
 Data is in `data/`. Outputs go to `results/`.
+
+## Airflow pipeline
+
+`secom.py` is split into three file-to-file stages (`stage_clean`, `stage_cv`, `stage_explain`) so
+each can run as its own task. `airflow/dags/secom_dag.py` schedules them daily:
+
+```
+download_data -> clean_features -> cross_validate -> explain -> publish_report
+```
+
+- Tasks pass data through `data/processed/` and `results/`, not XCom. Only small summaries go to
+  XCom so they show in the UI.
+- `publish_report` writes `results/reports/report_<date>.json` and fails the run if PR-AUC drops
+  below 0.10, so a bad retrain never overwrites a good report silently.
+- One retry per task, 5 minutes apart.
+
+Run it locally with Docker:
+
+```
+docker compose up --build
+```
+
+Then open http://localhost:8080 (the `standalone` command prints the admin password in the logs),
+unpause `secom_pipeline`, and trigger it. To run one full pass without the UI:
+
+```
+docker compose run --rm airflow airflow dags test secom_pipeline 2026-09-01
+```

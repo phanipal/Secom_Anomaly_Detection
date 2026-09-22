@@ -1,2 +1,6 @@
 .venv/
 __pycache__/
+.vs/
+data/processed/
+results/reports/
+logs/

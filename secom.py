@@ -3,7 +3,11 @@
 Isolation Forest vs class-weighted LogReg / XGBoost, stratified 5-fold CV,
 SHAP ranking on the best model.
 
-Outputs: results/metrics.json, results/pr_curves.png, results/shap_top20.png
+Three stages, each reading and writing files so they can run as separate
+Airflow tasks (see airflow/dags/secom_dag.py) or all at once via main():
+  stage_clean    data/secom.data -> data/processed/{features,labels}.csv
+  stage_cv       processed       -> results/oof_scores.csv, metrics.json, pr_curves.png
+  stage_explain  processed + metrics.json -> metrics.json (top sensors), shap_top20.png
 """
 import json
 from pathlib import Path
@@ -13,7 +17,6 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import shap
 from sklearn.ensemble import IsolationForest
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -24,14 +27,29 @@ from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
 ROOT = Path(__file__).parent
+DATA = ROOT / "data"
+PROC = DATA / "processed"
 OUT = ROOT / "results"
-OUT.mkdir(exist_ok=True)
 SEED = 42
+UCI = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/"
+
+
+def download(force=False):
+    """Fetch the two UCI files if missing. Returns the paths."""
+    import urllib.request
+    DATA.mkdir(exist_ok=True)
+    paths = []
+    for name in ("secom.data", "secom_labels.data"):
+        p = DATA / name
+        if force or not p.exists():
+            urllib.request.urlretrieve(UCI + name, p)
+        paths.append(p)
+    return paths
 
 
 def load():
-    X = pd.read_csv(ROOT / "data/secom.data", sep=r"\s+", header=None, na_values="NaN")
-    y = pd.read_csv(ROOT / "data/secom_labels.data", sep=r"\s+", header=None, usecols=[0])[0]
+    X = pd.read_csv(DATA / "secom.data", sep=r"\s+", header=None, na_values="NaN")
+    y = pd.read_csv(DATA / "secom_labels.data", sep=r"\s+", header=None, usecols=[0])[0]
     y = (y == 1).astype(int)  # 1 = fail (positive class), -1 = pass
     X.columns = [f"s{i}" for i in range(X.shape[1])]
     return X, y
@@ -77,11 +95,28 @@ def score(pipe, X):
     return pipe.predict_proba(X)[:, 1]
 
 
-def main():
+# ---------------- stages ----------------
+
+def stage_clean():
     X, y = load()
     X = clean(X)
+    PROC.mkdir(parents=True, exist_ok=True)
+    X.to_csv(PROC / "features.csv", index=False)
+    y.to_csv(PROC / "labels.csv", index=False, header=["fail"])
+    summary = {"rows": int(len(X)), "features": int(X.shape[1]), "fails": int(y.sum()), "fail_rate": round(float(y.mean()), 4)}
     print(f"rows={len(X)} features={X.shape[1]} fails={int(y.sum())} ({y.mean():.1%})")
+    return summary
 
+
+def _load_processed():
+    X = pd.read_csv(PROC / "features.csv")
+    y = pd.read_csv(PROC / "labels.csv")["fail"]
+    return X, y
+
+
+def stage_cv():
+    X, y = _load_processed()
+    OUT.mkdir(exist_ok=True)
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
     oof = {name: np.zeros(len(y)) for name in models(1, 1)}
     for tr, te in cv.split(X, y):
@@ -107,8 +142,17 @@ def main():
     plt.xlabel("Recall (fails caught)"); plt.ylabel("Precision"); plt.title("SECOM fail detection, 5-fold OOF")
     plt.legend(); plt.tight_layout(); plt.savefig(OUT / "pr_curves.png", dpi=130)
 
-    # SHAP on the best supervised model, refit on all data
-    best = max((k for k in oof if k != "isolation_forest"), key=lambda k: metrics[k]["pr_auc"])
+    metrics["best_model"] = max((k for k in oof if k != "isolation_forest"), key=lambda k: metrics[k]["pr_auc"])
+    pd.DataFrame(oof).to_csv(OUT / "oof_scores.csv", index=False)
+    (OUT / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    return metrics
+
+
+def stage_explain():
+    import shap
+    X, y = _load_processed()
+    metrics = json.loads((OUT / "metrics.json").read_text())
+    best = metrics["best_model"]
     pipe = models(y.sum(), (1 - y).sum())[best]()
     pipe.fit(X, y)
     Xi = pd.DataFrame(pipe[0].transform(X), columns=X.columns)
@@ -118,14 +162,20 @@ def main():
         Xs = pd.DataFrame(pipe[1].transform(Xi), columns=X.columns)
         sv = shap.LinearExplainer(pipe[-1], Xs).shap_values(Xs)
     imp = pd.Series(np.abs(sv).mean(0), index=X.columns).sort_values(ascending=False)
-    metrics["best_model"] = best
     metrics["top_10_sensors"] = imp.head(10).round(4).to_dict()
     plt.figure()
     shap.summary_plot(sv, Xi, max_display=20, show=False)
     plt.tight_layout(); plt.savefig(OUT / "shap_top20.png", dpi=130)
-
     (OUT / "metrics.json").write_text(json.dumps(metrics, indent=2))
-    print(json.dumps(metrics, indent=2))
+    return metrics["top_10_sensors"]
+
+
+def main():
+    download()
+    stage_clean()
+    stage_cv()
+    stage_explain()
+    print((OUT / "metrics.json").read_text())
 
 
 if __name__ == "__main__":
